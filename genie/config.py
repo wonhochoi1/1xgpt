@@ -38,6 +38,10 @@ class GenieConfig:
     proj_bias: bool = True
     attn_drop: float = 0.0
     qk_norm: bool = True
+    
+    # Efficient Attention Parameters
+    spatial_size: int = 16  # Spatial size for axial attention (16x16 patches)
+    temporal_window_size: int = 64  # Window size for temporal windowed attention
 
     # MLP
     mlp_ratio: float = 4.0

@@ -45,6 +45,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             mlp_ratio=config.mlp_ratio,
             mlp_bias=config.mlp_bias,
             mlp_drop=config.mlp_drop,
+            spatial_size=config.spatial_size,
+            temporal_window_size=config.temporal_window_size,
         )
 
         self.pos_embed_TSC = torch.nn.Parameter(torch.zeros(1, config.T, config.S, config.d_model))

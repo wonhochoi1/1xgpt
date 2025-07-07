@@ -1,7 +1,7 @@
 from torch import nn, Tensor
 from einops import rearrange
 
-from genie.attention import SelfAttention
+from genie.attention import SelfAttention, AxialAttention, WindowedAttention
 
 
 class Mlp(nn.Module):
@@ -39,13 +39,18 @@ class STBlock(nn.Module):
         mlp_ratio: float = 4.0,
         mlp_bias: bool = True,
         mlp_drop: float = 0.0,
+        spatial_size: int = 16,  # Default 16x16 spatial patches
+        temporal_window_size: int = 64,  # Window size for temporal attention
     ) -> None:
         super().__init__()
         self.norm1 = nn.Identity() if qk_norm else nn.LayerNorm(d_model, eps=1e-05)
-        # sequence dim is over each frame's 16x16 patch tokens
-        self.spatial_attn = SelfAttention(
+        
+        # Use AxialAttention for spatial data (2D patches)
+        self.spatial_attn = AxialAttention(
             num_heads=num_heads,
             d_model=d_model,
+            height=spatial_size,
+            width=spatial_size,
             qkv_bias=qkv_bias,
             proj_bias=proj_bias,
             qk_norm=qk_norm,
@@ -53,10 +58,11 @@ class STBlock(nn.Module):
             attn_drop=attn_drop,
         )
 
-        # sequence dim is over time sequence (16)
-        self.temporal_attn = SelfAttention(
+        # Use WindowedAttention for temporal data (time sequence)
+        self.temporal_attn = WindowedAttention(
             num_heads=num_heads,
             d_model=d_model,
+            window_size=temporal_window_size,
             qkv_bias=qkv_bias,
             proj_bias=proj_bias,
             qk_norm=qk_norm,
@@ -97,6 +103,8 @@ class STTransformerDecoder(nn.Module):
         mlp_ratio: float = 4.0,
         mlp_bias: bool = True,
         mlp_drop: float = 0.0,
+        spatial_size: int = 16,  # Default 16x16 spatial patches
+        temporal_window_size: int = 64,  # Window size for temporal attention
     ):
         super().__init__()
         self.layers = nn.ModuleList([STBlock(
@@ -110,6 +118,8 @@ class STTransformerDecoder(nn.Module):
             mlp_ratio=mlp_ratio,
             mlp_bias=mlp_bias,
             mlp_drop=mlp_drop,
+            spatial_size=spatial_size,
+            temporal_window_size=temporal_window_size,
         ) for _ in range(num_layers)])
 
     def forward(self, tgt):
