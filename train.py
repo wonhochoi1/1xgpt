@@ -350,22 +350,6 @@ def main():
 
     accelerator.wait_for_everyone()
 
-    train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
-                                    stride=args.stride, filter_overlaps=args.filter_overlaps)
-    if not args.overfit_first_batch:
-        eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
-                                       stride=args.stride, filter_overlaps=True)
-    else:
-        train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
-                                                                         * args.gradient_accumulation_steps
-                                                                         * accelerator.num_processes]
-        eval_dataset = train_dataset
-
-    assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
-               for shared_key in ("s", "vocab_size", "hz"))
-
-    latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
-
     if args.llama_config is not None:
         raise NotImplementedError("Have not factorized Llama vocabulary.")
         # # rope_theta 500_000: https://arxiv.org/abs/2309.16039
@@ -414,14 +398,36 @@ def main():
     else:
         config = GenieConfig.from_pretrained(args.genie_config)
         config.use_mup = args.mu_transfer  # Note: changing this may affect pre-trained model due to attn scaling
-        config.image_vocab_size = vocab_size
-        config.T = args.window_size
-        config.S = latent_side_len**2
         model = STMaskGIT(config)
 
         if args.mu_transfer:
             model.set_mup_shapes(rescale_params=True)
             model.init_weights()  # might be unnecessary if `rescale_params` is True
+
+    # Initialize datasets with action conditioning
+    train_dataset = RawTokenDataset(args.train_data_dir, window_size=args.window_size,
+                                    stride=args.stride, filter_overlaps=args.filter_overlaps,
+                                    use_action_conditioning=config.use_action_conditioning if args.genie_config else False)
+    if not args.overfit_first_batch:
+        eval_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size,
+                                       stride=args.stride, filter_overlaps=True,
+                                       use_action_conditioning=config.use_action_conditioning if args.genie_config else False)
+    else:
+        train_dataset.valid_start_inds = train_dataset.valid_start_inds[:args.per_device_train_batch_size
+                                                                         * args.gradient_accumulation_steps
+                                                                         * accelerator.num_processes]
+        eval_dataset = train_dataset
+
+    assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
+               for shared_key in ("s", "vocab_size", "hz"))
+
+    latent_side_len, vocab_size, hz = [train_dataset.metadata[key] for key in ("s", "vocab_size", "hz")]
+    
+    # Update config with dataset metadata
+    if args.genie_config:
+        config.image_vocab_size = vocab_size
+        config.T = args.window_size
+        config.S = latent_side_len**2
 
     # Optimizer. Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "layer_norm.weight"]

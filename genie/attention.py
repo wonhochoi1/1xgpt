@@ -1,9 +1,11 @@
 import torch
 from torch import nn
-from xformers.ops import LowerTriangularMask, memory_efficient_attention, unbind
+## UNCOMMENT IF XFORMERS_DISABLED == false
+# from xformers.ops import LowerTriangularMask, memory_efficient_attention, unbind
 import os
 
 
+#allows for using xformers or not - xformers are not supported on MacOS 
 XFORMERS_DISABLED = os.environ.get("XFORMERS_DISABLED", "false").lower() == "true"
 
 class BasicSelfAttention(nn.Module):

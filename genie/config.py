@@ -15,6 +15,13 @@ class GenieConfig:
     # actual model vocab size is larger to include special (e.g. mask) tokens.
     use_mup: bool = False
 
+    # Action conditioning
+    action_vocab_size: int = 1000  # vocabulary size for action tokens
+    action_embed_dim: int = 256  # embedding dimension for actions
+    use_action_conditioning: bool = True  # whether to use action conditioning
+    use_v2_format: bool = True  # whether to use v2.0 format (robot_states) or v1.1 format (separate actions)
+    num_action_dims: int = 25  # number of action/state dimensions (25 for v2.0)
+
     # Factorization for large vocabs (e.g. Open-MAGVIT2)
     num_factored_vocabs: int = 1
     factored_vocab_size: int = None
