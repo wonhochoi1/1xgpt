@@ -79,7 +79,7 @@ class GenieEvaluator:
         self.device = device
         self.args = args
 
-    def predict_zframe_logits(self, input_ids: torch.LongTensor) -> tuple[torch.LongTensor, torch.FloatTensor]:
+    def predict_zframe_logits(self, input_ids: torch.LongTensor, action_tokens: dict = None) -> tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Conditioned on each prefix: [frame_0], [frame_0, frame_1], ..., [frame_0, frame_1, ... frame_{T-1}],
         predict the tokens in the following frame: [pred_frame_1, pred_frame_2, ..., pred_frame_T].
@@ -91,6 +91,7 @@ class GenieEvaluator:
 
         Args:
             input_ids: LongTensor of size (B, T*H*W) corresponding to flattened, tokenized images.
+            action_tokens: Optional dict of action tokens for conditioning.
 
         Returns: (samples_THW, factored_logits)
             samples_THW:
@@ -112,7 +113,7 @@ class GenieEvaluator:
             # MaskGIT sampling
             samples_HW, factored_logits = self.model.maskgit_generate(
                 inputs_masked, out_t=timestep, maskgit_steps=self.args.maskgit_steps,
-                temperature=self.args.temperature,
+                temperature=self.args.temperature, action_tokens=action_tokens
             )
 
             all_samples.append(samples_HW)
@@ -147,7 +148,11 @@ def main():
     transformers.set_seed(42)
     args = parse_args()
 
-    val_dataset = RawTokenDataset(args.val_data_dir, window_size=WINDOW_SIZE, stride=STRIDE, filter_overlaps=True)
+    # Load model first to get config for action conditioning
+    model = STMaskGIT.from_pretrained(args.checkpoint_dir)
+    
+    val_dataset = RawTokenDataset(args.val_data_dir, window_size=WINDOW_SIZE, stride=STRIDE, filter_overlaps=True,
+                                 use_action_conditioning=model.config.use_action_conditioning)
     args.latent_h = args.latent_w = val_dataset.metadata["s"]
 
     decode_latents = decode_latents_wrapper()
@@ -156,7 +161,14 @@ def main():
     if args.max_examples is not None:
         val_dataset.valid_start_inds = val_dataset.valid_start_inds[:args.max_examples]
 
-    dataloader = DataLoader(val_dataset, collate_fn=default_data_collator, batch_size=args.batch_size)
+    # Use the appropriate collator based on whether action conditioning is enabled
+    if model.config.use_action_conditioning:
+        from data import get_maskgit_collator
+        collate_fn = get_maskgit_collator(model.config)
+    else:
+        collate_fn = default_data_collator
+    
+    dataloader = DataLoader(val_dataset, collate_fn=collate_fn, batch_size=args.batch_size)
 
     evaluator = GenieEvaluator(args, decode_latents)
     metrics = defaultdict(AvgMetric)
@@ -169,8 +181,11 @@ def main():
         reshaped_input_ids = rearrange(batch["input_ids"], "b (t h w) -> b t h w", t=WINDOW_SIZE,
                                        h=args.latent_h, w=args.latent_w)
 
+        # Get action tokens if available
+        action_tokens = batch.get("action_tokens", None)
+
         start_time = time.time()
-        samples, factored_logits = evaluator.predict_zframe_logits(batch["input_ids"])
+        samples, factored_logits = evaluator.predict_zframe_logits(batch["input_ids"], action_tokens)
         frames_per_batch = (WINDOW_SIZE - 1) * batch["input_ids"].size(0)
         metrics["gen_time"].update((time.time() - start_time) / frames_per_batch, batch_size)
 

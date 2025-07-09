@@ -63,16 +63,27 @@ def parse_args():
 def main():
     args = parse_args()
     assert args.num_prompt_frames <= args.window_size
-    val_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size, stride=STRIDE)
+    
+    # Load the model checkpoint first to get config
+    model = STMaskGIT.from_pretrained(args.checkpoint_dir).to("cuda")
+    model.eval()
+    
+    # Initialize dataset with action conditioning if enabled
+    val_dataset = RawTokenDataset(args.val_data_dir, window_size=args.window_size, stride=STRIDE,
+                                 use_action_conditioning=model.config.use_action_conditioning)
     latent_side_len = val_dataset.metadata["s"]
 
     # Get single example
-    example_THW = val_dataset[args.example_ind]["input_ids"].reshape(1, args.window_size, latent_side_len,
-                                                                     latent_side_len).to("cuda")
-
-    # Load the model checkpoint
-    model = STMaskGIT.from_pretrained(args.checkpoint_dir).to("cuda")
-    model.eval()
+    example_data = val_dataset[args.example_ind]
+    example_THW = example_data["input_ids"].reshape(1, args.window_size, latent_side_len,
+                                                   latent_side_len).to("cuda")
+    
+    # Get action tokens if available
+    action_tokens = None
+    if model.config.use_action_conditioning and "action_tokens" in example_data:
+        action_tokens = {}
+        for action_name, action_seq in example_data["action_tokens"].items():
+            action_tokens[action_name] = action_seq.unsqueeze(0).to("cuda")  # Add batch dimension
 
     samples = []
     prompt_THW = example_THW.clone()
@@ -83,10 +94,11 @@ def main():
         if args.teacher_force_time:
             prompt_THW = example_THW.clone()
             # Masked prediction for this timestep only, after which we provide ground-truth
-            prompt_THW[:, timestep:] = model.image_mask_token
+            prompt_THW[:, timestep:] = model.mask_token_id
 
         samples_HW, _ = model.maskgit_generate(
             prompt_THW, out_t=timestep, maskgit_steps=args.maskgit_steps, temperature=args.temperature,
+            action_tokens=action_tokens
         )
 
         samples.append(samples_HW)

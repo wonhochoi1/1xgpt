@@ -15,6 +15,13 @@ class GenieConfig:
     # actual model vocab size is larger to include special (e.g. mask) tokens.
     use_mup: bool = False
 
+    # Action conditioning
+    action_vocab_size: int = 1000  # vocabulary size for action tokens
+    action_embed_dim: int = 256  # embedding dimension for actions
+    use_action_conditioning: bool = True  # whether to use action conditioning
+    use_v2_format: bool = True  # whether to use v2.0 format (robot_states) or v1.1 format (separate actions)
+    num_action_dims: int = 25  # number of action/state dimensions (25 for v2.0)
+
     # Factorization for large vocabs (e.g. Open-MAGVIT2)
     num_factored_vocabs: int = 1
     factored_vocab_size: int = None
@@ -26,11 +33,22 @@ class GenieConfig:
     non_mlm_ratio: float = 0.5
     num_prompt_frames: int = 8
 
+    # Masked Pretraining parameters
+    initial_mask_ratio: float = 0.8  # Initial mask ratio for masked pretraining
+    final_mask_ratio: float = 0.1    # Final mask ratio for masked pretraining
+    mask_schedule: str = "cosine"     # Schedule for mask ratio decay: "cosine", "linear", "exponential"
+    mask_all_frames: bool = False     # Whether to mask all frames during pretraining
+    current_mask_ratio: float = None  # Current mask ratio (updated during training)
+
     # Attention
     qkv_bias: bool = False
     proj_bias: bool = True
     attn_drop: float = 0.0
     qk_norm: bool = True
+    
+    # Efficient Attention Parameters
+    spatial_size: int = 16  # Spatial size for axial attention (16x16 patches)
+    temporal_window_size: int = 64  # Window size for temporal windowed attention
 
     # MLP
     mlp_ratio: float = 4.0

@@ -22,7 +22,8 @@ class RawTokenDataset(TorchDataset):
         window_size,
         stride=1,
         filter_interrupts=True,
-        filter_overlaps=False
+        filter_overlaps=False,
+        use_action_conditioning=True
     ):
         """
         Args:
@@ -35,17 +36,40 @@ class RawTokenDataset(TorchDataset):
             filter_overlaps: If False (default), one frame will appear in multiple examples;
                 e.g. frame 0 might appear as the first frame in example 0 and also the second frame in example 15.
                 If True, will filter out examples so that each frame appears at most once in the dataset.
+            use_action_conditioning: Whether to load action data for conditioning
         """
         data_dir = Path(data_dir)
         with open(data_dir / "metadata.json") as f:
             self.metadata = json.load(f)
 
         shape = (self.metadata["num_images"], self.metadata["s"], self.metadata["s"])
-        video_tokens_path, segment_ids_path, action_tokens_path = [data_dir / f"{name}.bin"
-                                                                   for name in ["video", "segment_ids", "actions"]]
+        video_tokens_path, segment_ids_path = [data_dir / f"{name}.bin"
+                                              for name in ["video", "segment_ids"]]
         token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
         self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
-        # self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
+        
+        # Load action data if available and requested
+        self.use_action_conditioning = use_action_conditioning
+        self.actions = None
+        if use_action_conditioning:
+            actions_dir = data_dir / "actions"
+            if actions_dir.exists():
+                # Load all action types (neck_desired, driving_command, r_hand_closure, l_hand_closure)
+                action_files = ["neck_desired.bin", "driving_command.bin", "r_hand_closure.bin", "l_hand_closure.bin"]
+                self.actions = {}
+                for action_file in action_files:
+                    action_path = actions_dir / action_file
+                    if action_path.exists():
+                        action_name = action_file.replace(".bin", "")
+                        # Assuming actions are stored as uint16 tokens
+                        self.actions[action_name] = np.memmap(
+                            action_path, dtype=np.uint16, mode="r", 
+                            shape=(self.metadata["num_images"],)
+                        )
+                print(f"Loaded {len(self.actions)} action types: {list(self.actions.keys())}")
+            else:
+                print("Warning: Actions directory not found, disabling action conditioning")
+                self.use_action_conditioning = False
 
         if os.path.isfile(segment_ids_path):
             self.segment_ids = np.memmap(
@@ -92,18 +116,32 @@ class RawTokenDataset(TorchDataset):
     def __getitem__(self, idx):
         """
         Returns a flattened sequence of tokens representing `self.window_size` frames,
-        spaced `self.stride` apart.
+        spaced `self.stride` apart, along with corresponding action tokens.
         """
         start_ind = self.valid_start_inds[idx]
         x = torch.from_numpy((self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64))
         x = x.flatten()
 
         attention_mask = torch.ones_like(x)
-        return {
+        
+        result = {
             "input_ids": x,
             "labels": x,
             "attention_mask": attention_mask,
         }
+        
+        # Add action tokens if available
+        if self.use_action_conditioning and self.actions is not None:
+            # Get action tokens for the sequence (T-1 actions for T frames)
+            action_tokens = {}
+            for action_name, action_data in self.actions.items():
+                # Get actions corresponding to the frame sequence
+                action_seq = action_data[start_ind : start_ind + self.video_len : self.stride]
+                action_tokens[action_name] = torch.from_numpy(action_seq.astype(np.int64))
+            
+            result["action_tokens"] = action_tokens
+        
+        return result
 
 
 def get_maskgit_collator(config: GenieConfig):
@@ -161,9 +199,78 @@ def get_maskgit_collator(config: GenieConfig):
         x_THW = unfactorize_token_ids(x_THWC, config.num_factored_vocabs, config.factored_vocab_size)
         x_THW[:, first_masked_frame:][mask] = mask_token_id
 
-        return {
+        result = {
             "input_ids": rearrange(x_THW, "b t h w -> b (t h w)"),
             "labels": rearrange(labels, "b t h w -> b (t h w)"),
         }
+        
+        # Handle action tokens if present
+        if config.use_action_conditioning and "action_tokens" in features[0]:
+            # Stack action tokens from all features
+            action_tokens = {}
+            for action_name in features[0]["action_tokens"].keys():
+                action_tokens[action_name] = torch.stack([
+                    ex["action_tokens"][action_name] for ex in features
+                ])
+            result["action_tokens"] = action_tokens
 
+        return result
+
+    return collate_fn
+
+
+def get_masked_pretrain_collator(config: GenieConfig):
+    """
+    Collator for masked pretraining with higher initial mask ratios and varied schedules.
+    Implements MaskViT-style training where tokens are randomly masked across all frames.
+    """
+    mask_token_id = config.image_vocab_size
+    h = w = math.isqrt(config.S)
+
+    def collate_fn(features) -> dict[str, torch.Tensor]:
+        input_ids = torch.stack([ex["input_ids"] for ex in features])
+        device = input_ids.device
+        x_THW = rearrange(input_ids, "b (t h w) -> b t (h w)", b=len(features), t=config.T, h=h, w=w)
+        x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
+        labels = x_THW.clone()
+
+        # Get current mask ratio based on training progress
+        current_mask_ratio = getattr(config, 'current_mask_ratio', config.initial_mask_ratio)
+        if current_mask_ratio is None:
+            current_mask_ratio = config.initial_mask_ratio
+
+        # Determine which frames to mask
+        if getattr(config, 'mask_all_frames', False):
+            frames_to_mask = list(range(config.T))
+        else:
+            frames_to_mask = list(range(1, config.T))
+
+        batch_size = x_THW.shape[0]
+        S = x_THW.shape[2]
+
+        for frame_idx in frames_to_mask:
+            num_tokens_to_mask = int(S * current_mask_ratio)
+            # For each sample in the batch, generate a mask
+            mask = torch.zeros((batch_size, S), dtype=torch.bool, device=device)
+            for b in range(batch_size):
+                mask_indices = torch.randperm(S, device=device)[:num_tokens_to_mask]
+                mask[b, mask_indices] = True
+            # Apply mask to the frame for each sample
+            x_THW[:, frame_idx][mask] = mask_token_id
+        # Refactorize after masking
+        x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
+
+        result = {
+            "input_ids": rearrange(x_THW, "b t s -> b (t s)"),
+            "labels": rearrange(labels, "b t s -> b (t s)"),
+        }
+        # Handle action tokens if present
+        if config.use_action_conditioning and "action_tokens" in features[0]:
+            action_tokens = {}
+            for action_name in features[0]["action_tokens"].keys():
+                action_tokens[action_name] = torch.stack([
+                    ex["action_tokens"][action_name] for ex in features
+                ])
+            result["action_tokens"] = action_tokens
+        return result
     return collate_fn

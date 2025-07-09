@@ -45,6 +45,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             mlp_ratio=config.mlp_ratio,
             mlp_bias=config.mlp_bias,
             mlp_drop=config.mlp_drop,
+            spatial_size=config.spatial_size,
+            temporal_window_size=config.temporal_window_size,
         )
 
         self.pos_embed_TSC = torch.nn.Parameter(torch.zeros(1, config.T, config.S, config.d_model))
@@ -56,6 +58,33 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
             d_model=config.d_model,
             mask_token_id=self.mask_token_id,
         )
+
+        # Action conditioning
+        self.use_action_conditioning = config.use_action_conditioning
+        if self.use_action_conditioning:
+            # For v2.0 format: single robot_states tensor with 25 dimensions
+            # For v1.1 format: separate action types
+            self.action_embed_dim = config.action_embed_dim
+            self.num_action_dims = getattr(config, 'num_action_dims', 25)  # Default to v2.0 format
+            
+            # Create embedding for robot states (v2.0) or individual actions (v1.1)
+            if hasattr(config, 'use_v2_format') and config.use_v2_format:
+                # v2.0 format: single robot_states embedding
+                self.robot_states_embed = nn.Embedding(config.action_vocab_size, config.action_embed_dim)
+                # Project from action_embed_dim to model dimension
+                self.action_proj = nn.Linear(config.action_embed_dim, config.d_model)
+            else:
+                # v1.1 format: separate action embeddings
+                self.action_embeddings = nn.ModuleDict({
+                    'neck_desired': nn.Embedding(config.action_vocab_size, config.action_embed_dim),
+                    'driving_command': nn.Embedding(config.action_vocab_size, config.action_embed_dim),
+                    'r_hand_closure': nn.Embedding(config.action_vocab_size, config.action_embed_dim),
+                    'l_hand_closure': nn.Embedding(config.action_vocab_size, config.action_embed_dim),
+                })
+                
+                # Project action embeddings to model dimension
+                total_action_dim = len(self.action_embeddings) * config.action_embed_dim
+                self.action_proj = nn.Linear(total_action_dim, config.d_model)
 
         cls = FixedMuReadout if config.use_mup else nn.Linear  # (Fixed)MuReadout might slow dow down compiled training?
         self.out_x_proj = cls(config.d_model, config.factored_vocab_size * config.num_factored_vocabs)
@@ -71,6 +100,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         return_logits: int = False,
         maskgit_steps: int = 1,
         temperature: float = 0.0,
+        action_tokens: dict = None,
     ) -> tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Args designed to match the format of Llama.
@@ -101,7 +131,8 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
                 inputs_masked_THW,
                 timestep,
                 maskgit_steps=maskgit_steps,
-                temperature=temperature
+                temperature=temperature,
+                action_tokens=action_tokens
             )
             inputs_masked_THW[:, timestep] = sample_HW
             all_factored_logits.append(factored_logits)
@@ -127,6 +158,7 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         maskgit_steps: int = 1,
         temperature: float = 0.0,
         unmask_mode: str = "random",
+        action_tokens: dict = None,
     ) -> tuple[torch.LongTensor, torch.FloatTensor]:
         """
         Performs MaskGIT-style inference to predict frame `out_t`.
@@ -160,13 +192,13 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # this will be modified in place on each iteration of this loop
         unmasked = self.init_mask(prompt_THW)
 
-        logits_CTHW = self.compute_logits(prompt_THW)
+        logits_CTHW = self.compute_logits(prompt_THW, action_tokens)
         logits_CHW = logits_CTHW[:, :, out_t]
         orig_logits_CHW = logits_CHW.clone()  # Return these original logits, not logits after partially sampling.
         for step in tqdm(range(maskgit_steps)):
             # Perform a single maskgit step (cosine schedule), updating unmasked in-place
             if step > 0:  # recompute logits with updated prompt
-                logits_CHW = self.compute_logits(prompt_THW)[:, :, out_t]
+                logits_CHW = self.compute_logits(prompt_THW, action_tokens)[:, :, out_t]
 
             factored_logits = rearrange(logits_CHW, "b (num_vocabs vocab_size) h w -> b vocab_size num_vocabs h w",
                                         vocab_size=self.config.factored_vocab_size,
@@ -240,8 +272,29 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
 
         factored_targets = factorize_labels(targets_THW)
 
-        loss_THW = F.cross_entropy(factored_logits, factored_targets, reduction="none").sum(dim=1)
-        acc_THW = (factored_logits.argmax(dim=1) == factored_targets).all(dim=1)
+        # Compute loss for each factorized vocabulary separately
+        B, vocab_size, num_vocabs, T, H, W = factored_logits.shape
+        loss_THW = torch.zeros(B, T, H, W, device=factored_logits.device)
+        
+        for i in range(self.config.num_factored_vocabs):
+            # Extract logits and targets for this vocabulary
+            vocab_logits = factored_logits[:, :, i]  # (B, vocab_size, T, H, W)
+            vocab_targets = factored_targets[:, i]    # (B, T, H, W)
+            
+            # Compute cross entropy loss for this vocabulary
+            vocab_loss = F.cross_entropy(vocab_logits, vocab_targets, reduction="none")  # (B, T, H, W)
+            loss_THW += vocab_loss
+
+        # Compute accuracy
+        acc_THW = torch.ones(B, T, H, W, dtype=torch.bool, device=factored_logits.device)
+        
+        for i in range(self.config.num_factored_vocabs):
+            vocab_logits = factored_logits[:, :, i]  # (B, vocab_size, T, H, W)
+            vocab_targets = factored_targets[:, i]    # (B, T, H, W)
+            
+            # Check if prediction matches target for this vocabulary
+            vocab_acc = (vocab_logits.argmax(dim=1) == vocab_targets)  # (B, T, H, W)
+            acc_THW = acc_THW & vocab_acc  # All vocabularies must be correct
 
         # Compute the mean masked error.
         # Multiply loss values by mask instead of indexing them, more computationally efficient.
@@ -252,10 +305,61 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         # only optimize on the masked/noised logits?
         return relevant_loss, relevant_acc
 
-    def compute_logits(self, x_THW):
+    def compute_logits(self, x_THW, action_tokens=None):
         # x_THW is for z0,...,zT while x_targets is z1,...,zT
         x_TS = rearrange(x_THW, "B T H W -> B T (H W)")
         x_TSC = self.token_embed(x_TS)
+
+        # Add action conditioning if available
+        if self.use_action_conditioning and action_tokens is not None:
+            # Process action embeddings
+            if hasattr(self, 'robot_states_embed'):
+                # v2.0 format: single robot_states tensor
+                if 'robot_states' in action_tokens:
+                    # action_tokens['robot_states'] shape: (B, T-1, 25) - 25 state dimensions
+                    robot_states = action_tokens['robot_states']  # (B, T-1, 25)
+                    
+                    # For now, we'll use the first state dimension as the action token
+                    # In a more sophisticated implementation, you might want to process all 25 dimensions
+                    action_seq = robot_states[:, :, 0]  # (B, T-1) - use first state dimension
+                    action_embed = self.robot_states_embed(action_seq)  # (B, T-1, action_embed_dim)
+                    action_proj = self.action_proj(action_embed)  # (B, T-1, d_model)
+                    
+                    # Pad action embeddings to match temporal dimension
+                    batch_size, T, d_model = action_proj.shape[0], x_TSC.shape[1], action_proj.shape[2]
+                    padded_action_proj = torch.zeros(batch_size, T, d_model, 
+                                                   device=action_proj.device, dtype=action_proj.dtype)
+                    padded_action_proj[:, 1:, :] = action_proj  # Skip first frame, no action before it
+                    
+                    # Broadcast action embeddings across spatial dimension
+                    padded_action_proj = padded_action_proj.unsqueeze(2)  # (B, T, 1, C)
+                    x_TSC = x_TSC + padded_action_proj  # Broadcasting: (B, T, 1, C) + (B, T, S, C) -> (B, T, S, C)
+            else:
+                # v1.1 format: separate action types
+                action_embeds = []
+                for action_name, action_seq in action_tokens.items():
+                    if action_name in self.action_embeddings:
+                        # action_seq shape: (B, T-1) - one action per frame transition
+                        action_embed = self.action_embeddings[action_name](action_seq)  # (B, T-1, action_embed_dim)
+                        action_embeds.append(action_embed)
+                
+                if action_embeds:
+                    # Concatenate all action embeddings
+                    combined_action_embed = torch.cat(action_embeds, dim=-1)  # (B, T-1, total_action_dim)
+                    action_proj = self.action_proj(combined_action_embed)  # (B, T-1, d_model)
+                    
+                    # Pad action embeddings to match temporal dimension (add zero embedding for first frame)
+                    batch_size, T, d_model = action_proj.shape[0], x_TSC.shape[1], action_proj.shape[2]
+                    padded_action_proj = torch.zeros(batch_size, T, d_model, 
+                                                   device=action_proj.device, dtype=action_proj.dtype)
+                    # Actions correspond to transitions between frames, so pad with zeros for first frame
+                    padded_action_proj[:, 1:, :] = action_proj  # Skip first frame, no action before it
+                    
+                    # Broadcast action embeddings across spatial dimension and add to token embeddings
+                    # x_TSC shape: (B, T, S, C), padded_action_proj shape: (B, T, C)
+                    # We need to expand padded_action_proj to (B, T, 1, C) then broadcast to (B, T, S, C)
+                    padded_action_proj = padded_action_proj.unsqueeze(2)  # (B, T, 1, C)
+                    x_TSC = x_TSC + padded_action_proj  # Broadcasting: (B, T, 1, C) + (B, T, S, C) -> (B, T, S, C)
 
         # additive embeddings, using the same vocab space
         x_TSC = self.decoder(x_TSC + self.pos_embed_TSC)
@@ -264,11 +368,11 @@ class STMaskGIT(nn.Module, PyTorchModelHubMixin):
         logits_CTHW = rearrange(x_next_TSC, "B T (H W) C -> B C T H W", H=self.h, W=self.w)
         return logits_CTHW
 
-    def forward(self, input_ids, labels):
+    def forward(self, input_ids, labels, action_tokens=None):
         T, H, W = self.config.T, self.h, self.w
         x_THW = rearrange(input_ids, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
-        logits_CTHW = self.compute_logits(x_THW)
+        logits_CTHW = self.compute_logits(x_THW, action_tokens)
 
         labels = rearrange(labels, "B (T H W) -> B T H W", T=T, H=H, W=W)
 
