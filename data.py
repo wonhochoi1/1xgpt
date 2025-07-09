@@ -217,3 +217,60 @@ def get_maskgit_collator(config: GenieConfig):
         return result
 
     return collate_fn
+
+
+def get_masked_pretrain_collator(config: GenieConfig):
+    """
+    Collator for masked pretraining with higher initial mask ratios and varied schedules.
+    Implements MaskViT-style training where tokens are randomly masked across all frames.
+    """
+    mask_token_id = config.image_vocab_size
+    h = w = math.isqrt(config.S)
+
+    def collate_fn(features) -> dict[str, torch.Tensor]:
+        input_ids = torch.stack([ex["input_ids"] for ex in features])
+        device = input_ids.device
+        x_THW = rearrange(input_ids, "b (t h w) -> b t (h w)", b=len(features), t=config.T, h=h, w=w)
+        x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
+        labels = x_THW.clone()
+
+        # Get current mask ratio based on training progress
+        current_mask_ratio = getattr(config, 'current_mask_ratio', config.initial_mask_ratio)
+        if current_mask_ratio is None:
+            current_mask_ratio = config.initial_mask_ratio
+
+        # Determine which frames to mask
+        if getattr(config, 'mask_all_frames', False):
+            frames_to_mask = list(range(config.T))
+        else:
+            frames_to_mask = list(range(1, config.T))
+
+        batch_size = x_THW.shape[0]
+        S = x_THW.shape[2]
+
+        for frame_idx in frames_to_mask:
+            num_tokens_to_mask = int(S * current_mask_ratio)
+            # For each sample in the batch, generate a mask
+            mask = torch.zeros((batch_size, S), dtype=torch.bool, device=device)
+            for b in range(batch_size):
+                mask_indices = torch.randperm(S, device=device)[:num_tokens_to_mask]
+                mask[b, mask_indices] = True
+            # Apply mask to the frame for each sample
+            x_THW[:, frame_idx][mask] = mask_token_id
+        # Refactorize after masking
+        x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
+
+        result = {
+            "input_ids": rearrange(x_THW, "b t s -> b (t s)"),
+            "labels": rearrange(labels, "b t s -> b (t s)"),
+        }
+        # Handle action tokens if present
+        if config.use_action_conditioning and "action_tokens" in features[0]:
+            action_tokens = {}
+            for action_name in features[0]["action_tokens"].keys():
+                action_tokens[action_name] = torch.stack([
+                    ex["action_tokens"][action_name] for ex in features
+                ])
+            result["action_tokens"] = action_tokens
+        return result
+    return collate_fn

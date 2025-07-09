@@ -33,6 +33,13 @@ class GenieConfig:
     non_mlm_ratio: float = 0.5
     num_prompt_frames: int = 8
 
+    # Masked Pretraining parameters
+    initial_mask_ratio: float = 0.8  # Initial mask ratio for masked pretraining
+    final_mask_ratio: float = 0.1    # Final mask ratio for masked pretraining
+    mask_schedule: str = "cosine"     # Schedule for mask ratio decay: "cosine", "linear", "exponential"
+    mask_all_frames: bool = False     # Whether to mask all frames during pretraining
+    current_mask_ratio: float = None  # Current mask ratio (updated during training)
+
     # Attention
     qkv_bias: bool = False
     proj_bias: bool = True
